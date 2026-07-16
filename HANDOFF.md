@@ -180,7 +180,68 @@ Vite + React, already scaffolded. Build:
    tell the user to revoke the token(s) that were shared in chat once
    your access is confirmed working.
 
-## 7. Explicitly out of scope / don't over-build
+## 8. Fund detail pages & risk/performance metrics
+
+Each fund gets a detail page (`/fund/:schemeCode`, needs
+`react-router-dom` — not yet in `package.json`, add it) showing a
+Parameter | Value | What it measures table, mirroring the reference
+screenshot the user provided ("Portfolio Risk and Performance
+Measures"). The 11 metrics, grouped by data dependency:
+
+| Metric | Needs | Formula / method |
+|---|---|---|
+| Standard Deviation | NAV only | σ_monthly × √12 |
+| Maximum Drawdown | NAV only | min over t of (NAV_t − runningPeak_t) / runningPeak_t |
+| VaR (95%) | NAV only | parametric: mean(R) − 1.645×σ(R), over trailing monthly returns |
+| Expected Shortfall / CVaR (95%) | NAV only | mean of returns below the VaR cutoff |
+| Sharpe Ratio | NAV + risk-free rate | (annualized return − r_f) / annualized σ |
+| Sortino Ratio | NAV + risk-free rate | (annualized return − r_f) / downside deviation |
+| Beta (β) | NAV + benchmark | Cov(R_fund, R_bench) / Var(R_bench), linear regression |
+| R-Squared | NAV + benchmark | correlation(R_fund, R_bench)² |
+| Tracking Error | NAV + benchmark | annualized σ of (R_fund − R_bench) |
+| Alpha (α) | NAV + benchmark + r_f + β | R_fund_annual − [r_f + β×(R_bench_annual − r_f)] |
+| Treynor Ratio | NAV + benchmark + r_f + β | (annualized return − r_f) / β |
+
+**Two benchmarks per fund, not one:**
+- **Target index** (Tracking Error, R²) — the index the fund is
+  actually designed to replicate. For factor funds, that's the
+  matching style index from `data/raw/index-history/` (e.g. a
+  Momentum fund → Nifty200 Momentum 30). For sector funds, the
+  matching sector index — same series already pulled for §2's
+  heatmap.
+- **Broad market** (Beta, Alpha, Treynor) — Nifty 500 TRI, used
+  uniformly so funds are comparable to each other regardless of
+  strategy.
+
+**Raw data layer (new — sits underneath the derived files in §2/§3):**
+```
+data/raw/index-history/{indexName}.json   — monthly index levels
+data/raw/nav-history/{schemeCode}.json    — monthly NAV per scheme
+data/risk-free-rate.json                  — manually maintained (91-day
+                                             T-Bill yield); don't add a
+                                             third scraper for this, it
+                                             changes rarely
+```
+Both `fetch_sector_style_data.py` and `fetch_fund_data.py` should
+write/append to this raw layer as a side effect, so `scripts/
+compute_risk_metrics.py` (new) can read from it directly instead of
+re-fetching from mfapi.in or the index sources. Append new data points
+incrementally each month rather than re-pulling full history.
+
+**Output:** `data/risk-metrics.json`, keyed by scheme code, computed
+over a 3-year monthly trailing window as the default (industry
+standard for Beta/Alpha/Sharpe/R² in Indian fund research). If a
+scheme has fewer than ~36 monthly NAV points, write `null` with a
+`"reason": "insufficient_history"` per metric rather than computing on
+too little data — the frontend shows "Insufficient history" instead of
+a number, never a misleading one.
+
+**Frontend copy:** use the "What it measures" text from the reference
+screenshot verbatim as the second column — it's already clear,
+one-line, and non-technical. Don't re-write it into denser finance
+jargon.
+
+## 9. Explicitly out of scope / don't over-build
 
 - No user accounts, no persistence beyond the repo's own JSON files.
 - No attempt to exactly reproduce FundsIndia's proprietary index
