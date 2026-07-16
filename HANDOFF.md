@@ -16,7 +16,7 @@ Your job: build everything described below.
 
 ## 1. Product summary
 
-A site with three parts:
+A site with four parts:
 
 1. **Sector returns heatmap** — 12 sectors × year (2010→2026 YTD),
    ranked top-to-bottom by return within each year column, color-coded
@@ -28,7 +28,9 @@ A site with three parts:
 3. **Strategy picker → fund recommendations** — user manually selects
    a strategy from a menu (locked decision, no quiz/auto-pick):
    - **Contrarian** — surface the sector(s)/style(s) with the worst
-     trailing 1-year return, and funds mapped to them.
+     trailing 1-year return, and funds mapped to them (now resolves to
+     real SEBI Value/Contra category funds too, not just smart-beta —
+     see §3.5).
    - **Momentum** — surface the best trailing 1-year performers.
    - **Quality & Low Volatility** (defensive) — pinned to those two
      style factors regardless of recent performance.
@@ -39,6 +41,13 @@ A site with three parts:
    Each strategy resolves to a shortlist of 3–5 mutual funds, ranked
    by trailing return computed from real NAV data (§3) — not a
    static list.
+4. **Fund screener** — faceted browse/filter over the full classified
+   equity universe from §3: SEBI category, geography, active vs.
+   index/ETF, factor tilt. This and the strategy picker (#3) are two
+   entry points into the same underlying data — the picker pre-sets
+   facets for someone who wants a shortcut; the screener is for
+   someone who wants to browse directly. Don't build them as separate
+   data paths.
 
 ## 2. Data layer — sector & style returns
 
@@ -85,53 +94,104 @@ FundsIndia's proprietary methodology — the category boundaries and
 exact weighting won't match their table point-for-point, and that's
 fine and expected.
 
-## 3. Data layer — mutual funds
+## 3. Data layer — the equity fund universe & classification
 
-**File:** `data/funds.json`
+This is the core of what makes this a product for retail investors
+rather than a curated shortlist: **every open-ended equity scheme in
+India, classified across 5 independent axes**, not a hand-picked
+dozen.
 
-**Source:** `mfapi.in` — free, unauthenticated, daily NAV history per
-scheme, no rate limiting observed historically (verify current terms
-before relying on it in production). Endpoints: `/mf` (scheme list),
-`/mf/{code}` (NAV history for a scheme).
+### 3.1 The source: AMFI's own scheme data, not name-guessing
 
-**Approach — do not try to classify all ~14,000 Indian MF schemes by
-style.** That's not a well-defined problem. Instead, map each
-sector/style directly to real **index/smart-beta funds and sector
-funds that track it** — India has actual products for this. Starter
-list to search for on mfapi.in and verify current scheme
-codes/expense details (names drift — confirm against the AMC's
-current factsheet before shipping):
+`https://portal.amfiindia.com/DownloadSchemeData_Po.aspx?mf=0` —
+AMFI's structured scheme master, one row per scheme-code, with
+explicit columns: AMC, Scheme Name, Scheme Type, **Scheme Category**
+(the SEBI-mandated label — e.g. "Equity Scheme - Flexi Cap Fund",
+"Equity Scheme - Large & Mid Cap Fund", "Other Scheme - Index Funds",
+"Other Scheme - FoF Overseas"), launch date, ISIN. This is
+authoritative — SEBI requires it — so axis 1, and part of axes 3/5,
+come from this field directly, not from parsing fund names.
 
-- Momentum → UTI Nifty200 Momentum 30 Index Fund, Nippon India Nifty
-  Midcap150 Momentum 50 Index Fund
-- Value → ICICI Prudential Nifty500 Value 50 Index Fund, DSP Nifty50
-  Value 20 ETF/Index Fund
-- Quality → ICICI Prudential Nifty200 Quality 30 ETF, Edelweiss
-  Nifty100 Quality 30 Index Fund
-- Low Volatility → ICICI Prudential Nifty100 Low Volatility 30 ETF,
-  Nippon India ETF Nifty 100 Low Volatility 30
-- Dividend Yield → ICICI Prudential Nifty Dividend Opportunities 50
-  ETF, UTI Nifty Dividend Opportunities 50 Index Fund
-- Size (Midcap) → UTI Nifty Midcap 150 Quality 50 Index Fund, Motilal
-  Oswal Nifty Midcap 150 Index Fund
-- Global → Motilal Oswal Nasdaq 100 FOF, ICICI Prudential US Bluechip
-  Equity Fund
-- Sector funds (coverage is uneven — some sectors have none, note
-  that in the UI rather than forcing a bad match): Healthcare/Pharma
-  (SBI Healthcare Opportunities, Nippon India Pharma), IT (ICICI
-  Prudential Technology Fund), Banking/Financials (ICICI Prudential
-  Banking & Financial Services), FMCG (ICICI Prudential FMCG Fund),
-  Consumption as a rough Cons Disc. proxy (ICICI Prudential Bharat
-  Consumption Fund). Auto, Metals, Realty, Media, Oil & Gas, Telecom,
-  Utilities generally lack dedicated MF products in India — say so
-  explicitly rather than mapping to a loose fit.
+**Do not hardcode the category enum from this doc.** Pull the live
+file and read the actual current set of category strings before
+writing the classifier. SEBI introduced a new "Omni FOF"
+re-categorization framework in Nov 2025 that AMCs are still migrating
+into — the FoF taxonomy specifically is a moving target right now, so
+treat the whole category list as something to verify at build time,
+not something fixed.
 
-**Script:** `scripts/fetch_fund_data.py` — resolve each mapping to a
-scheme code via the mfapi.in scheme-list search, pull NAV history,
-compute trailing 1yr/3yr/5yr returns (CAGR for >1yr), rank within each
-category, write `funds.json`. Ranking is by trailing return only (no
-risk-adjustment, no expense ratio — mfapi.in doesn't carry those) —
-say so in the UI copy so it doesn't read as more rigorous than it is.
+Scheme codes in this file are the same numeric codes mfapi.in uses —
+joins directly onto the NAV pipeline in §8, no separate ID mapping
+needed.
+
+### 3.2 De-duplication — do this before anything else
+
+Every actual fund appears as 4–8 separate scheme codes (Regular/Direct
+× Growth/IDCW, sometimes legacy plans on top). Collapse to **one row
+per fund: Direct Plan, Growth Option.** This is the standard
+convention for fair return comparison (excludes distributor commission
+drag, avoids dividend-reinvestment NAV distortion) and it's what turns
+"every scheme code" (several thousand rows) into "every actual fund" —
+a few hundred once de-duped, which is entirely tractable. Never show a
+retail user 6 near-identical rows for what's economically one fund.
+
+### 3.3 The five axes
+
+| Axis | Source | Confidence |
+|---|---|---|
+| 1. SEBI category (Large/Mid/Small Cap, Large&Mid, Multi Cap, Flexi Cap, Focused, Sectoral/Thematic, Value, Contra, Dividend Yield, ELSS) | AMFI Scheme Category field | Authoritative |
+| 2. Geography (Domestic/International/Global/Regional) | Inferred from name keywords (US, Nasdaq, China, Europe, ASEAN, Global, Emerging Market) + FoF-Overseas as a strong signal | Inferred — **flag confidence per record, don't assert as fact** |
+| 3. Passive structure (Active/Index/ETF) | AMFI category ("Other Scheme - Index Funds"/"- ETFs") | Authoritative |
+| 4. Smart-beta factor tilt (Momentum/Value/Quality/Low Vol/Dividend Yield/Size) | Only within the axis-3 Index/ETF subset; read off the scheme name — factor-index naming is standardized (e.g. "Nifty200 Momentum 30") | Inferred, high-confidence |
+| 5. Structure (Pure equity/Fund of Funds) | AMFI category ("Other Scheme - FoF Domestic/Overseas" vs "Equity Scheme - X") | Authoritative (watch the Omni FOF transition, §3.1) |
+
+### 3.4 Output schema — `data/fund-master.json`
+
+```json
+{
+  "schemeCode": "119598",
+  "amc": "ICICI Prudential",
+  "fundName": "ICICI Prudential Value Discovery Fund",
+  "isin": "...",
+  "launchDate": "1994-08-16",
+  "sebiCategory": "Equity Scheme - Value Fund",
+  "structure": "active",
+  "geography": { "value": "domestic", "confidence": "high" },
+  "factorTilt": null,
+  "planVariant": "direct_growth"
+}
+```
+
+### 3.5 This replaces the old curated list, it doesn't sit alongside it
+
+Sector/style/strategy fund lists become **queries** over
+`fund-master.json` instead of a hardcoded list:
+- Contrarian → `sebiCategory in [Value Fund, Contra Fund]` OR
+  `factorTilt = value`, ranked by trailing return from §8's
+  risk-metrics data — which now applies to the whole universe, not a
+  shortlist.
+- Momentum → `factorTilt = momentum`.
+- Sector picks → `sebiCategory = Sectoral/Thematic` AND name matches
+  the sector keyword.
+- Known names like ICICI Prudential Technology Fund, SBI Healthcare
+  Opportunities, UTI Nifty200 Momentum 30 Index Fund, etc. are still
+  useful — as **known-good test cases** to spot-check that the
+  classifier puts them where you'd expect, not as the mapping itself.
+
+**Script:** `scripts/classify_funds.py` — pulls the AMFI scheme file,
+de-dupes to Direct-Growth, tags all 5 axes, writes
+`data/fund-master.json`. Runs monthly alongside §2/§8 — new schemes
+launch constantly, re-classify each cycle.
+
+**Script:** `scripts/fetch_fund_data.py` — for every scheme in
+`fund-master.json`, pulls NAV history from `mfapi.in` (free,
+unauthenticated; verify current rate limits/terms before relying on it
+at this scale — a few hundred schemes is a lot more calls than the
+original ~20-fund list), computes trailing 1yr/3yr/5yr returns (CAGR
+beyond 1yr), writes returns into the raw NAV cache from §8. Ranking is
+by trailing return only (no expense ratio — mfapi.in doesn't carry
+it) — say so in the UI copy so it doesn't read as more rigorous than
+it is.
 
 ## 4. Automation
 
